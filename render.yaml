@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: siom-streamer
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    plan: free
+    envVars:
+      - key: API_ID
+        value: "34394791"
+      - key: API_HASH
+        value: "0efc220ee6012f2499359e7a6f6fc42b"
+      - key: BOT_TOKEN
+        value: "9139736297:AAGjYwmFGt6seuMnbb6qaBImVPv3VAii-hY"
+      - key: CHANNEL_ID
+        value: "-1003995387951"
