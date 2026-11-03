@@ -43,9 +43,10 @@ async def index():
     }
 
 @app.api_route("/stream/{message_id}", methods=["GET", "HEAD"])
-async def stream_media(message_id: int, request: Request):
+async def stream_media(message_id: str, request: Request):
     try:
-        msg = await client.get_messages(CHANNEL_ID, ids=message_id)
+        clean_id = int(str(message_id).split(".")[0])
+        msg = await client.get_messages(CHANNEL_ID, ids=clean_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
