@@ -2,6 +2,7 @@ import os
 import re
 import json
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,6 +22,13 @@ db_state = {
     "views": {}
 }
 is_db_dirty = False
+
+# ==========================================
+# IN-MEMORY MEDIA & METADATA CACHE (RAM)
+# ==========================================
+# Caches Telegram media objects, file sizes, and MIME types so seeking
+# forward/backward takes 0 ms without querying the Telegram API on each HTTP Range request.
+MEDIA_CACHE = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -85,7 +93,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-CHUNK_SIZE = 512 * 1024  # 512 KB per chunk
+# 1 MB chunk size for high-throughput streaming (reduces MTProto round-trip overhead by 50%)
+CHUNK_SIZE = 1024 * 1024
 
 @app.get("/")
 async def index():
@@ -94,7 +103,8 @@ async def index():
         "service": "SiomJourney Telegram Stream Bridge & Views DB",
         "channel": CHANNEL_ID,
         "visits": db_state.get("visits", 1285),
-        "tracked_movies": len(db_state.get("views", {}))
+        "tracked_movies": len(db_state.get("views", {})),
+        "cached_media": len(MEDIA_CACHE)
     }
 
 # ==========================================
@@ -133,23 +143,46 @@ async def increment_visits():
     }
 
 # ==========================================
-# STREAMING ENDPOINT
+# HIGH-SPEED STREAMING ENDPOINT WITH RAM CACHE
 # ==========================================
 @app.api_route("/stream/{message_id}", methods=["GET", "HEAD"])
 async def stream_media(message_id: str, request: Request):
     try:
         clean_id = int(str(message_id).split(".")[0])
-        msg = await client.get_messages(CHANNEL_ID, ids=clean_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid message id")
 
-    if not msg or not msg.media or not getattr(msg, 'file', None):
-        raise HTTPException(status_code=404, detail=f"No media found for message id {message_id}")
+    # 1. Check in-memory RAM cache first
+    cached = MEDIA_CACHE.get(clean_id)
+    if cached is None:
+        try:
+            msg = await client.get_messages(CHANNEL_ID, ids=clean_id)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
-    total_size = msg.file.size
-    file_name = getattr(msg.file, 'name', None) or f"movie_{message_id}.mp4"
-    mime_type = getattr(msg.file, 'mime_type', None) or "video/mp4"
+        if not msg or not msg.media or not getattr(msg, 'file', None):
+            raise HTTPException(status_code=404, detail=f"No media found for message id {message_id}")
 
+        total_size = msg.file.size
+        file_name = getattr(msg.file, 'name', None) or f"movie_{clean_id}.mp4"
+        mime_type = getattr(msg.file, 'mime_type', None) or "video/mp4"
+
+        cached = {
+            "media": msg.media,
+            "size": total_size,
+            "name": file_name,
+            "mime": mime_type,
+            "created_at": time.time()
+        }
+        MEDIA_CACHE[clean_id] = cached
+    else:
+        total_size = cached["size"]
+        file_name = cached["name"]
+        mime_type = cached["mime"]
+
+    media_obj = cached["media"]
+
+    # 2. Parse HTTP Range header
     range_header = request.headers.get("range")
     start = 0
     end = total_size - 1
@@ -175,14 +208,16 @@ async def stream_media(message_id: str, request: Request):
         "Content-Disposition": f'inline; filename="{file_name}"',
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length, Content-Type",
+        "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
     }
 
     if request.method == "HEAD":
         return Response(status_code=206 if range_header else 200, headers=headers)
 
+    # 3. High-throughput chunk streaming directly from cached media
     async def iter_file():
         remaining = content_length
-        async for chunk in client.iter_download(msg.media, offset=start, limit=content_length, chunk_size=CHUNK_SIZE):
+        async for chunk in client.iter_download(media_obj, offset=start, limit=content_length, chunk_size=CHUNK_SIZE):
             if remaining <= 0:
                 break
             if len(chunk) > remaining:
