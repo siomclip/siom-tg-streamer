@@ -1,5 +1,7 @@
 import os
 import re
+import json
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,19 +12,70 @@ API_ID = int(os.environ.get("API_ID", "34394791"))
 API_HASH = os.environ.get("API_HASH", "0efc220ee6012f2499359e7a6f6fc42b")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "9139736297:AAGjYwmFGt6seuMnbb6qaBImVPv3VAii-hY")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-1003995387951"))
+DB_MESSAGE_ID = int(os.environ.get("DB_MESSAGE_ID", "21"))
 
 client = TelegramClient('siom_stream_session', API_ID, API_HASH)
 
+db_state = {
+    "visits": 1285,
+    "views": {}
+}
+is_db_dirty = False
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global db_state, is_db_dirty
     print("Connecting to Telegram...")
     await client.start(bot_token=BOT_TOKEN)
     print("Telegram Bot connected successfully!")
+    
+    # Load database from Telegram Message #21
+    try:
+        msg = await client.get_messages(CHANNEL_ID, ids=DB_MESSAGE_ID)
+        if msg and msg.text and ("SIOM_DB_STORE:" in msg.text or "SIOM_DB_VIEW_STORE:" in msg.text):
+            raw_text = msg.text
+            if "SIOM_DB_STORE:" in raw_text:
+                raw_json = raw_text.split("SIOM_DB_STORE:", 1)[1].strip()
+            else:
+                raw_json = raw_text.split("SIOM_DB_VIEW_STORE:", 1)[1].strip()
+            loaded = json.loads(raw_json)
+            if isinstance(loaded, dict):
+                if "visits" in loaded:
+                    db_state["visits"] = loaded["visits"]
+                if "views" in loaded:
+                    db_state["views"] = loaded["views"]
+                print(f"Loaded DB state: {len(db_state.get('views', {}))} movies, {db_state.get('visits')} visits.")
+    except Exception as e:
+        print(f"Error loading DB from TG msg #{DB_MESSAGE_ID}: {e}")
+
+    # Background debounced sync task
+    async def db_sync_loop():
+        global is_db_dirty
+        while True:
+            await asyncio.sleep(5)
+            if is_db_dirty:
+                try:
+                    payload = f"SIOM_DB_STORE: {json.dumps(db_state, ensure_ascii=False)}"
+                    await client.edit_message(CHANNEL_ID, DB_MESSAGE_ID, payload)
+                    is_db_dirty = False
+                    with open("views_backup.json", "w", encoding="utf-8") as f:
+                        json.dump(db_state, f, ensure_ascii=False)
+                except Exception as sync_err:
+                    print(f"Error syncing DB to Telegram: {sync_err}")
+
+    sync_task = asyncio.create_task(db_sync_loop())
     yield
+    sync_task.cancel()
+    if is_db_dirty:
+        try:
+            payload = f"SIOM_DB_STORE: {json.dumps(db_state, ensure_ascii=False)}"
+            await client.edit_message(CHANNEL_ID, DB_MESSAGE_ID, payload)
+        except Exception:
+            pass
     print("Disconnecting Telegram...")
     await client.disconnect()
 
-app = FastAPI(title="SiomJourney TG Streamer", lifespan=lifespan)
+app = FastAPI(title="SiomJourney TG Streamer & Global Views API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,10 +91,50 @@ CHUNK_SIZE = 512 * 1024  # 512 KB per chunk
 async def index():
     return {
         "status": "online",
-        "service": "SiomJourney Telegram Stream Bridge",
-        "channel": CHANNEL_ID
+        "service": "SiomJourney Telegram Stream Bridge & Views DB",
+        "channel": CHANNEL_ID,
+        "visits": db_state.get("visits", 1285),
+        "tracked_movies": len(db_state.get("views", {}))
     }
 
+# ==========================================
+# GLOBAL VIEWS & VISITS ENDPOINTS
+# ==========================================
+@app.get("/api/views")
+async def get_all_views():
+    return {
+        "success": True,
+        "visits": db_state.get("visits", 1285),
+        "views": db_state.get("views", {})
+    }
+
+@app.api_route("/api/views/{movie_id}/increment", methods=["GET", "POST"])
+async def increment_view(movie_id: str):
+    global is_db_dirty
+    views = db_state.setdefault("views", {})
+    current = int(views.get(movie_id, 0))
+    views[movie_id] = current + 1
+    is_db_dirty = True
+    return {
+        "success": True,
+        "id": movie_id,
+        "views": views[movie_id]
+    }
+
+@app.api_route("/api/visits/increment", methods=["GET", "POST"])
+async def increment_visits():
+    global is_db_dirty
+    current = int(db_state.get("visits", 1285))
+    db_state["visits"] = current + 1
+    is_db_dirty = True
+    return {
+        "success": True,
+        "visits": db_state["visits"]
+    }
+
+# ==========================================
+# STREAMING ENDPOINT
+# ==========================================
 @app.api_route("/stream/{message_id}", methods=["GET", "HEAD"])
 async def stream_media(message_id: str, request: Request):
     try:
