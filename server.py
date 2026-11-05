@@ -164,7 +164,9 @@ async def stream_media(message_id: str, request: Request):
             raise HTTPException(status_code=404, detail=f"No media found for message id {message_id}")
 
         total_size = msg.file.size
-        file_name = getattr(msg.file, 'name', None) or f"movie_{clean_id}.mp4"
+        raw_file_name = getattr(msg.file, 'name', None) or f"movie_{clean_id}.mp4"
+        # Latin-1 HTTP header uyumlulugu icin ASCII olmayan Turkce karakterleri temizle
+        file_name = re.sub(r'[^\x00-\x7f]', '_', raw_file_name) or f"movie_{clean_id}.mp4"
         mime_type = getattr(msg.file, 'mime_type', None) or "video/mp4"
 
         cached = {
@@ -200,12 +202,13 @@ async def stream_media(message_id: str, request: Request):
     end = min(end, total_size - 1)
     content_length = (end - start) + 1
 
+    safe_filename = re.sub(r'[^\x00-\x7f]', '_', str(file_name)) or f"movie_{clean_id}.mp4"
     headers = {
         "Content-Range": f"bytes {start}-{end}/{total_size}",
         "Accept-Ranges": "bytes",
         "Content-Length": str(content_length),
         "Content-Type": mime_type,
-        "Content-Disposition": f'inline; filename="{file_name}"',
+        "Content-Disposition": f'inline; filename="{safe_filename}"',
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length, Content-Type",
         "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
